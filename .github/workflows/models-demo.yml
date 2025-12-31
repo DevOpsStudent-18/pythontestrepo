@@ -79,19 +79,19 @@ jobs:
           DIFF_FILE="${{ steps.trim.outputs.diff_file }}"
           # Convert files to JSON-safe strings
           SYS_PROMPT=$(cat << 'SYS'
-You are a senior code reviewer. Provide concise, prioritized, and actionable feedback.
-Focus on:
-1) Correctness & potential bugs
-2) Security issues (injection, XSS, SSRF, secrets, unsafe deserialization)
-3) Performance pitfalls & resource usage
-4) Concurrency & reliability
-5) Maintainability (structure, naming, duplication)
-6) Tests: missing cases and coverage
-7) Documentation: comments, README, usage notes
+          You are a senior code reviewer. Provide concise, prioritized, and actionable feedback.
+          Focus on:
+          1) Correctness & potential bugs
+          2) Security issues (injection, XSS, SSRF, secrets, unsafe deserialization)
+          3) Performance pitfalls & resource usage
+          4) Concurrency & reliability
+          5) Maintainability (structure, naming, duplication)
+          6) Tests: missing cases and coverage
+          7) Documentation: comments, README, usage notes
 
-If the diff seems partial or truncated, explicitly state assumptions and call out risky areas needing deeper inspection. Prefer bullet points and include short code snippets for suggested fixes where relevant.
-SYS
-)
+          If the diff seems partial or truncated, explicitly state assumptions and call out risky areas needing deeper inspection. Prefer bullet points and include short code snippets for suggested fixes where relevant.
+          SYS
+          )
           PR_SUMMARY_JSON=$(jq -Rs '.' pr_summary.txt)
           DIFF_JSON=$(jq -Rs '.' "$DIFF_FILE")
 
