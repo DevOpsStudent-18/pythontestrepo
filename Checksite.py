@@ -3,7 +3,7 @@ import requests
 
 def check_website_status(url):
     try:
-        response = requests.get(url, timeout=5)
+        response = requests.get(url)
         if response.status_code == 200:
             print(f" The website '{url}' is up and running!")
         else:
