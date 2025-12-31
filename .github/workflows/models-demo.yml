@@ -13,11 +13,12 @@ permissions:
 jobs:
   review-pr:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Install GitHub CLI so we can call `gh pr diff`
+      # Install GitHub CLI (gh) so we can use `gh pr diff`
       - name: Install GitHub CLI
         shell: bash
         run: |
@@ -26,6 +27,7 @@ jobs:
           sudo apt-get install -y gh
           gh --version
 
+      # Get unified PR diff via gh (works with forks & shallow clones)
       - name: Get PR diff (via GitHub CLI)
         id: diff
         env:
@@ -34,31 +36,126 @@ jobs:
         run: |
           set -euo pipefail
           PR_NUMBER="$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")"
+          PR_TITLE="$(jq -r '.pull_request.title' "$GITHUB_EVENT_PATH")"
+          PR_AUTHOR="$(jq -r '.pull_request.user.login' "$GITHUB_EVENT_PATH")"
+          BASE_REF="$(jq -r '.pull_request.base.ref' "$GITHUB_EVENT_PATH")"
+          HEAD_REF="$(jq -r '.pull_request.head.ref' "$GITHUB_EVENT_PATH")"
 
-          # Fetch unified patch diff robustly (works for forks/shallow checkouts)
+          echo "PR #$PR_NUMBER: $PR_TITLE by $PR_AUTHOR ($HEAD_REF -> $BASE_REF)"
+
+          # Unified textual patch
           gh pr diff "$PR_NUMBER" --patch > pr.diff
 
-          # Expose PR number to later steps
+          # Summary file for the model
+          {
+            echo "PR Number: #$PR_NUMBER"
+            echo "PR Title: $PR_TITLE"
+            echo "Author: $PR_AUTHOR"
+            echo "Base Branch: $BASE_REF"
+            echo "Head Branch: $HEAD_REF"
+          } > pr_summary.txt
+
           echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
 
+      # (Optional) Trim very large diffs to keep prompt size sane
+      - name: Trim diff if too large
+        id: trim
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAX_CHARS=120000
+          SIZE="$(wc -c < pr.diff)"
+          if [ "$SIZE" -gt "$MAX_CHARS" ]; then
+            echo "Diff size $SIZE exceeds $MAX_CHARS; truncating for model input."
+            head -c "$MAX_CHARS" pr.diff > pr.trimmed
+            printf "\n\n[... Diff truncated for AI review due to size ...]\n" >> pr.trimmed
+            echo "diff_file=pr.trimmed" >> "$GITHUB_OUTPUT"
+          else
+            echo "diff_file=pr.diff" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Call GitHub Models with robust JSON payload & error handling
       - name: Call GitHub Model for Review
         id: ai-review
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
-          PROMPT=$(jq -Rs '.' pr.diff)
-          RESPONSE=$(curl -s "https://models.github.ai/inference/chat/completions" \
+          set -euo pipefail
+
+          DIFF_FILE="${{ steps.trim.outputs.diff_file }}"
+          [ -z "$DIFF_FILE" ] && DIFF_FILE="pr.diff"
+
+          # System prompt (senior code reviewer rubric)
+          SYS_PROMPT=$(cat << 'SYS'
+          You are a senior code reviewer. Provide concise, prioritized, and actionable feedback.
+          Focus on:
+          1) Correctness & potential bugs
+          2) Security issues (injection, XSS, SSRF, secrets, unsafe deserialization)
+          3) Performance pitfalls & resource usage
+          4) Concurrency & reliability
+          5) Maintainability (structure, naming, duplication)
+          6) Tests: missing cases and coverage
+          7) Documentation: comments, README, usage notes
+
+          If the diff is partial or truncated, state assumptions and call out risky areas to re-check.
+          Prefer bullet points and include short code snippets for suggested fixes.
+          SYS
+          )
+
+          # Compose user content: summary + unified diff
+          USER_CONTENT="$(cat pr_summary.txt; printf '\n\n=== Unified Diff ===\n'; cat "$DIFF_FILE")"
+
+          # Build JSON payload safely with jq -n
+          PAYLOAD="$(jq -n \
+            --arg model "openai/gpt-4o-mini" \
+            --arg sys "$SYS_PROMPT" \
+            --arg user "$USER_CONTENT" \
+            --argjson temperature 0.2 \
+            '{
+              model: $model,
+              temperature: $temperature,
+              messages: [
+                {role: "system", content: $sys},
+                {role: "user", content: $user}
+              ]
+            }')"
+
+          # Call the endpoint, capturing HTTP status and body separately
+          BODY_FILE="response.json"
+          HTTP_CODE="$(curl -sS -o "$BODY_FILE" -w '%{http_code}' \
+            "https://models.github.ai/inference/chat/completions" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -d "{
-              \"model\": \"openai/gpt-4o-mini\",
-              \"messages\": [
-                {\"role\": \"system\", \"content\": \"You are a senior code reviewer. Provide concise, actionable feedback.\"},
-                {\"role\": \"user\", \"content\": \"Review this PR diff and suggest improvements:\\n$PROMPT\"}
-              ]
-            }" | jq -r '.choices[0].message.content')
-          echo "$RESPONSE" > review.md
+            -d "$PAYLOAD")"
 
+          # Handle non-200 errors gracefully
+          if [ "$HTTP_CODE" != "200" ]; then
+            {
+              echo "Model API returned HTTP $HTTP_CODE"
+              echo
+              echo "Payload (first 2000 chars):"
+              echo "$PAYLOAD" | head -c 2000
+              echo
+              echo "Response body (first 500 lines):"
+              sed -n '1,500p' "$BODY_FILE"
+            } > review.md
+            exit 0
+          fi
+
+          # Parse model response
+          RESPONSE="$(jq -r '.choices[0].message.content // empty' < "$BODY_FILE" || true)"
+
+          if [ -z "$RESPONSE" ]; then
+            {
+              echo "(No content returned by model. Raw API body follows)"
+              sed -n '1,500p' "$BODY_FILE"
+            } > review.md
+          else
+            echo "$RESPONSE" > review.md
+          fi
+
+      # Post the AI review as a PR comment
       - name: Post AI Review Comment
         uses: actions/github-script@v7
         with:
@@ -70,5 +167,5 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: prNumber,
-              body: `### 🤖 AI Review\n\n${body}`
+              body: `### 🤖 AI Review (GitHub Models)\n\n${body}\n\n---\n_Model: openai/gpt-4o-mini · Temperature: 0.2_`
             });
